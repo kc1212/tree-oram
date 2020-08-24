@@ -1,9 +1,7 @@
-use std::borrow::Borrow;
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 use rand::prelude::*;
 
 use serde::{Deserialize, Serialize};
-use std::thread::current;
 
 #[derive(Debug)]
 struct Server<T: Clone> {
@@ -74,7 +72,7 @@ trait ORAM {
     fn pop(&self) -> Result<Block, String>;
 
     fn read(&self, u: Idx) -> Result<Block, String> {
-        let block = self.read_and_remove(u)?.clone();
+        let block = self.read_and_remove(u)?;
         self.add(&block)?;
         Ok(block)
     }
@@ -136,6 +134,12 @@ impl TrivialORAM {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    fn dump_data(&self) -> Vec<Block> {
+        self.server.inner.borrow() .iter().map(|s| {
+            self.dec(s).unwrap()
+        }).collect()
+    }
 }
 
 impl ORAM for TrivialORAM {
@@ -145,8 +149,10 @@ impl ORAM for TrivialORAM {
             let block = self.server.read(i).unwrap();
             let block: Block = self.dec(&block)?;
             if block.u == u {
+                let mut empty_block = Block::empty();
+                empty_block.leaf = block.leaf;
+                self.server.write(i, self.enc(&empty_block)?);
                 output = Ok(block);
-                self.server.write(i, self.enc(&Block::empty())?);
             } else {
                 self.server.write(i, self.enc(&block)?);
             }
@@ -169,15 +175,27 @@ impl ORAM for TrivialORAM {
     }
 
     fn pop(&self) -> Result<Block, String> {
-        let mut output = Ok(Block::empty());
+        let write_empty = |r: &Result<Block, String>| {
+            match r {
+                Ok(x) => x.empty,
+                Err(_) => true,
+            }
+        };
+
+        let mut output = Err(String::from("no output"));
         for i in 0..self.server.length {
             let block = self.server.read(i).unwrap();
             let block: Block = self.dec(&block)?;
             if block.empty {
                 self.server.write(i, self.enc(&block)?);
+                if write_empty(&output) {
+                    output = Ok(block);
+                }
             } else {
+                let mut empty_block = Block::empty();
+                empty_block.leaf = block.leaf;
+                self.server.write(i, self.enc(&empty_block)?);
                 output = Ok(block);
-                self.server.write(i, self.enc(&Block::empty())?);
             }
         }
         output
@@ -231,25 +249,11 @@ fn extend_path_rand(path: &Path, total_length: usize) -> (LeafIdx, Path) {
     (path_to_leaf(&new_path), new_path)
 }
 
-#[derive(Debug)]
-struct Bucket {
-    inner: TrivialORAM
-}
-
-impl Bucket {
-    fn new(bucket_size: usize) -> Bucket {
-        Bucket { inner: TrivialORAM::new(bucket_size) }
-    }
-
-    fn with_leaf_generator<F>(bucket_size: usize, leaf_generator: &F) -> Bucket
-        where F : Fn() -> LeafIdx {
-        Bucket { inner: TrivialORAM::with_leaf_generator(bucket_size, leaf_generator) }
-    }
-}
+type Bucket = TrivialORAM;
 
 #[derive(Debug)]
 struct TreeNode {
-    value: Bucket,
+    bucket: Bucket,
     left: Option<Box<TreeNode>>,
     right: Option<Box<TreeNode>>,
 }
@@ -257,7 +261,7 @@ struct TreeNode {
 impl TreeNode {
     fn new(bucket: Bucket) -> TreeNode {
         TreeNode {
-            value: bucket,
+            bucket,
             left: None,
             right: None,
         }
@@ -288,7 +292,8 @@ fn log2usize(x: usize) -> usize {
 
 impl TreeORAM {
     fn new(depth: usize) -> TreeORAM {
-        let bucket_size = depth; // bucket size should be O(log(N)), so using the depth should be ok
+        let bucket_size = std::cmp::max(1, depth); // bucket size should be O(log(N)), so using the depth should be ok
+
         let f = |path: &Path| {
             let leaf_gen = || {
                 let (leaf, _) = extend_path_rand(path, depth);
@@ -323,12 +328,12 @@ impl TreeORAM {
             let node = TreeNode::new(node_constructor(current_path));
             Some(Box::new(node))
         } else {
-            let mut new_node = TreeNode::new(node_constructor(current_path));
+            let mut node = TreeNode::new(node_constructor(current_path));
             let mut path_left = current_path.clone(); path_left.push(Direction::Left);
-            let mut path_right = current_path.clone(); path_right.push(Direction::Left);
-            new_node.left = TreeORAM::create_tree_rec(depth - 1, &path_left, node_constructor);
-            new_node.right = TreeORAM::create_tree_rec(depth - 1, &path_right, node_constructor);
-            Some(Box::new(new_node))
+            let mut path_right = current_path.clone(); path_right.push(Direction::Right);
+            node.left = TreeORAM::create_tree_rec(depth - 1, &path_left, node_constructor);
+            node.right = TreeORAM::create_tree_rec(depth - 1, &path_right, node_constructor);
+            Some(Box::new(node))
         }
     }
 
@@ -356,12 +361,10 @@ impl TreeORAM {
         // NOTE: pop checks one block in the bucket, not all
         fn rec(node: &Box<TreeNode>, current_path: &Path, depth: usize) -> bool {
             if current_path.len() == depth {
-                let b = node.value.inner.pop().unwrap();
-                println!("base {:?} =? {:?}", leaf_to_path(b.leaf, depth), *current_path);
+                let b = node.bucket.pop().unwrap();
                 leaf_to_path(b.leaf, depth) == *current_path
             } else {
-                let b = node.value.inner.pop().unwrap();
-                println!("recu {:?} =? {:?}", leaf_to_path(b.leaf, current_path.len()), *current_path);
+                let b = node.bucket.pop().unwrap();
                 let ok = leaf_to_path(b.leaf, current_path.len()) == *current_path;
                 let mut left_path = current_path.clone(); left_path.push(Direction::Left);
                 let mut right_path = current_path.clone(); right_path.push(Direction::Right);
@@ -377,20 +380,20 @@ impl TreeORAM {
             let s = self.all_buckets_at_depth(d);
             let a: Vec<&&TreeNode> = s.choose_multiple(&mut rand::thread_rng(), self.eviction_rate).collect();
             for node in a {
-                let block = node.value.inner.pop()?;
+                let block = node.bucket.pop()?;
                 let path = leaf_to_path(block.leaf, self.depth);
-                println!("path: {:?}, depth: {:?}", path, d);
-                let b = path[d+1];
+                let b = path[d]; // NOTE: but the paper says d+1?
 
                 let empty_msg = String::from("empty");
+                // println!("evicting {:?} {:?}, {:?}", path, b, block);
                 match b {
                     Direction::Left => {
-                        node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.value.inner.write(&block))?;
-                        node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.value.inner.write(&Block::empty()))?;
+                        node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&block))?;
+                        node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&Block::empty()))?;
                     },
                     Direction::Right => {
-                        node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.value.inner.write(&block))?;
-                        node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.value.inner.write(&Block::empty()))?;
+                        node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&block))?;
+                        node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&Block::empty()))?;
                     }
                 }
             }
@@ -415,9 +418,14 @@ impl TreeORAM {
 
 impl ORAM for TreeORAM {
     fn read_and_remove(&self, u: usize) -> Result<Block, String> {
+        if u >= self.position_map.borrow().len() {
+            return Err(String::from("invalid index"));
+        }
+
         let (leaf_star, path_star) = random_path(self.depth);
         let leaf = self.position_map.borrow()[u];
         let path = leaf_to_path(leaf, self.depth);
+        // println!("reading u: {:?}, leaf: {:?}, path: {:?}", u, leaf, path);
 
         self.position_map.borrow_mut()[u] = leaf_star;
         *self.state.borrow_mut() = Some(path_to_leaf(&path_star));
@@ -425,8 +433,8 @@ impl ORAM for TreeORAM {
         let mut out = Block::empty();
         let mut current_node = self.root.as_ref();
         for i in 0..self.depth {
-            let x = current_node.value.inner.read_and_remove(u)?;
-            if !x.empty {
+            let x = current_node.bucket.read_and_remove(u)?;
+            if !x.empty && u == x.u {
                 out = x;
             }
             if path[i] == Direction::Left {
@@ -435,14 +443,15 @@ impl ORAM for TreeORAM {
                 current_node = current_node.right.as_ref().unwrap();
             }
         }
+        // println!("read and remove {:?}", out);
         Ok(out)
     }
 
     fn add(&self, block: &Block) -> Result<(), String> {
         if let Some(leaf) = *self.state.borrow() {
-            let mut block = block.clone();
-            block.leaf = leaf;
-            self.root.value.borrow().inner.write(&block)?;
+            let mut new_block = block.clone();
+            new_block.leaf = leaf;
+            self.root.bucket.write(&new_block)?;
             self.evict()?;
             // TODO clear the state?
             Ok(())
@@ -463,8 +472,17 @@ mod tests {
 
     #[test]
     fn trivial_oram() {
-        let oram = TrivialORAM::new(10);
+        let oram_size = 10;
+        let oram = TrivialORAM::new(oram_size);
 
+        // test encoding
+        for b in vec![Block::empty(), Block::new(1, rand::random(), rand::random())] {
+            let encoded = oram.enc(&b).unwrap();
+            let decoded = oram.dec(&encoded).unwrap();
+            assert_eq!(b, decoded);
+        }
+
+        // test actual oram
         assert!(oram.pop().unwrap().empty);
         for i in 0..oram.server.length {
             assert!(oram.read(i).unwrap().empty);
@@ -496,6 +514,8 @@ mod tests {
             assert_eq!(oram.write(&Block::empty_with_u(1)).unwrap(), ());
         }
         assert!(oram.pop().unwrap().empty);
+
+        assert_eq!(oram.dump_data().len(), oram_size);
     }
 
     #[test]
@@ -513,24 +533,54 @@ mod tests {
         }
     }
 
+    fn generic_tree_oram_io(oram_depth: usize) {
+        let leaves_count = 2usize.pow(oram_depth as u32);
+        let tree = TreeORAM::new(oram_depth);
+
+        // check all is empty
+        for i in 0..tree.get_n() {
+            assert!(tree.read(i).unwrap().empty);
+        }
+
+        // it doesn't matter what leaf is, it will be over written
+        tree.write(&Block::new(0, [u8::max_value(); 32], 0)).unwrap();
+        assert!(!tree.read(0).unwrap().empty);
+
+        // check writing
+        for u in vec![0, 1, 2, 8, leaves_count-1] {
+            let block = Block::new(u, [u as u8; 32], 0);
+            tree.write(&block).unwrap();
+            let result = tree.read(u).unwrap();
+
+            // we don't check the leaf because that's randomized
+            assert!(!result.empty);
+            assert_eq!(result.inner, block.inner);
+            assert_eq!(result.u, block.u);
+        }
+
+        // read empty indices
+        for u in vec![3, 4, 9, 10] {
+            let result = tree.read(u).unwrap();
+            assert!(result.empty);
+        }
+
+        // write to index that doesn't exist
+        let bad_index_block = Block::new(leaves_count, [0; 32], 0);
+        assert_eq!(tree.write(&bad_index_block).err().unwrap(), "invalid index");
+    }
+
     #[test]
     fn tree_functions() {
-        for d in vec![0, 1, 2, 5, 10] {
+        // sanity check
+        for d in vec![0, 1, 4] {
             let tree = TreeORAM::new(d);
             assert_eq!(tree.count_nodes(), tree.get_buckets_count());
             assert_eq!(tree.position_map.borrow().len(), 1 << d);
             assert!(tree.sanity_check_paths());
         }
 
-        let tree = TreeORAM::new(4);
-        for i in 0..tree.get_n() {
-            assert!(tree.read(i).unwrap().empty);
-        }
-
-        let (leaf, _) = random_path(4);
-        println!("writing");
-        tree.write(&Block::new(0, [0; 32], leaf)).unwrap();
-        println!("reading");
-        assert!(!tree.read(0).unwrap().empty);
+        // generic test
+        generic_tree_oram_io(4);
+        generic_tree_oram_io(5);
     }
 }
