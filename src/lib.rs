@@ -70,6 +70,7 @@ trait ORAM {
     fn read_and_remove(&self, u: Idx) -> Result<Block, String>;
     fn add(&self, block: &Block) -> Result<(), String>;
     fn pop(&self) -> Result<Block, String>;
+    fn capacity(&self) -> usize;
 
     fn read(&self, u: Idx) -> Result<Block, String> {
         let block = self.read_and_remove(u)?;
@@ -159,7 +160,6 @@ impl ORAM for TrivialORAM {
         }
         output
     }
-
     fn add(&self, block: &Block) -> Result<(), String> {
         let mut written = false;
         for i in 0..self.server.length {
@@ -199,6 +199,10 @@ impl ORAM for TrivialORAM {
             }
         }
         output
+    }
+
+    fn capacity(&self) -> usize {
+        self.server.length
     }
 }
 
@@ -272,7 +276,7 @@ struct TreeORAM {
     depth: usize,
     root: Box<TreeNode>,
     state: RefCell<Option<LeafIdx>>,
-    position_map: RefCell<Vec<LeafIdx>>, // mapping of block index and leaf
+    position_map: Box<dyn ORAM>, // mapping of block index and leaf
     eviction_rate: usize,
 }
 
@@ -304,14 +308,13 @@ impl TreeORAM {
         let boxed_tree = TreeORAM::create_tree(depth, &f).unwrap();
 
         let leaves_count = 2usize.pow(depth as u32);
-        let mut position_map: Vec<usize> = (0..leaves_count).collect();
-        position_map.shuffle(&mut rand::thread_rng());
+        let position_map = TrivialORAM::new(leaves_count);
 
         TreeORAM {
             depth,
             root: boxed_tree,
             state: RefCell::new(None),
-            position_map: RefCell::new(position_map),
+            position_map: Box::new(position_map),
             eviction_rate: 2,
         }
     }
@@ -386,6 +389,7 @@ impl TreeORAM {
 
                 let empty_msg = String::from("empty");
                 // println!("evicting {:?} {:?}, {:?}", path, b, block);
+                // TODO write order leaks information
                 match b {
                     Direction::Left => {
                         node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&block))?;
@@ -416,18 +420,30 @@ impl TreeORAM {
     }
 }
 
+fn encode_leaf(leaf: &LeafIdx) -> [u8; 32] {
+    let mut out: [u8; 32] = [0; 32];
+    out[..8].copy_from_slice(&leaf.to_be_bytes());
+    out
+}
+
+fn decode_leaf(encoded: &[u8; 32]) -> LeafIdx {
+    let mut tmp: [u8; 8] = [0; 8];
+    tmp.copy_from_slice(&encoded[..8]);
+    LeafIdx::from_be_bytes(tmp)
+}
+
 impl ORAM for TreeORAM {
     fn read_and_remove(&self, u: usize) -> Result<Block, String> {
-        if u >= self.position_map.borrow().len() {
+        if u >= self.position_map.capacity() {
             return Err(String::from("invalid index"));
         }
 
         let (leaf_star, path_star) = random_path(self.depth);
-        let leaf = self.position_map.borrow()[u];
+        let leaf = decode_leaf(&self.position_map.read(u)?.inner);
         let path = leaf_to_path(leaf, self.depth);
         // println!("reading u: {:?}, leaf: {:?}, path: {:?}", u, leaf, path);
 
-        self.position_map.borrow_mut()[u] = leaf_star;
+        self.position_map.write(&Block::new(u, encode_leaf(&leaf_star), 0))?;
         *self.state.borrow_mut() = Some(path_to_leaf(&path_star));
 
         let mut out = Block::empty();
@@ -462,6 +478,10 @@ impl ORAM for TreeORAM {
 
     fn pop(&self) -> Result<Block, String> {
         unimplemented!()
+    }
+
+    fn capacity(&self) -> usize {
+        self.get_n()
     }
 }
 
@@ -531,6 +551,14 @@ mod tests {
         for leaf in 0..15 {
             assert_eq!(path_to_leaf(&leaf_to_path(leaf, 4)), leaf);
         }
+
+        assert_eq!(decode_leaf(&encode_leaf(&0)), 0);
+        for _ in 0..10 {
+            let leaf: LeafIdx = rand::random();
+            let encoded = encode_leaf(&leaf);
+            let decoded = decode_leaf(&encoded);
+            assert_eq!(leaf, decoded);
+        }
     }
 
     fn generic_tree_oram_io(oram_depth: usize) {
@@ -575,7 +603,7 @@ mod tests {
         for d in vec![0, 1, 4] {
             let tree = TreeORAM::new(d);
             assert_eq!(tree.count_nodes(), tree.get_buckets_count());
-            assert_eq!(tree.position_map.borrow().len(), 1 << d);
+            assert_eq!(tree.position_map.capacity(), 1 << d);
             assert!(tree.sanity_check_paths());
         }
 
