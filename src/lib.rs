@@ -69,7 +69,6 @@ type LeafIdx = usize;
 trait ORAM {
     fn read_and_remove(&self, u: Idx) -> Result<Block, String>;
     fn add(&self, block: &Block) -> Result<(), String>;
-    fn pop(&self) -> Result<Block, String>;
     fn capacity(&self) -> usize;
 
     fn read(&self, u: Idx) -> Result<Block, String> {
@@ -141,38 +140,6 @@ impl TrivialORAM {
             self.dec(s).unwrap()
         }).collect()
     }
-}
-
-impl ORAM for TrivialORAM {
-    fn read_and_remove(&self, u: Idx) -> Result<Block, String> {
-        let mut output = Ok(Block::empty());
-        for i in 0..self.server.length {
-            let block = self.server.read(i).unwrap();
-            let block: Block = self.dec(&block)?;
-            if block.u == u {
-                let mut empty_block = Block::empty();
-                empty_block.leaf = block.leaf;
-                self.server.write(i, self.enc(&empty_block)?);
-                output = Ok(block);
-            } else {
-                self.server.write(i, self.enc(&block)?);
-            }
-        }
-        output
-    }
-    fn add(&self, block: &Block) -> Result<(), String> {
-        let mut written = false;
-        for i in 0..self.server.length {
-            let block_i: Block = self.dec(&self.server.read(i).unwrap())?;
-            if block_i.empty && !written {
-                self.server.write(i, self.enc(&block)?);
-                written = true;
-            } else {
-                self.server.write(i, self.enc(&block_i)?);
-            }
-        }
-        Ok(())
-    }
 
     fn pop(&self) -> Result<Block, String> {
         let write_empty = |r: &Result<Block, String>| {
@@ -199,6 +166,40 @@ impl ORAM for TrivialORAM {
             }
         }
         output
+    }
+
+}
+
+impl ORAM for TrivialORAM {
+    fn read_and_remove(&self, u: Idx) -> Result<Block, String> {
+        let mut output = Ok(Block::empty());
+        for i in 0..self.server.length {
+            let block = self.server.read(i).unwrap();
+            let block: Block = self.dec(&block)?;
+            if block.u == u {
+                let mut empty_block = Block::empty();
+                empty_block.leaf = block.leaf;
+                self.server.write(i, self.enc(&empty_block)?);
+                output = Ok(block);
+            } else {
+                self.server.write(i, self.enc(&block)?);
+            }
+        }
+        output
+    }
+
+    fn add(&self, block: &Block) -> Result<(), String> {
+        let mut written = false;
+        for i in 0..self.server.length {
+            let block_i: Block = self.dec(&self.server.read(i).unwrap())?;
+            if block_i.empty && !written {
+                self.server.write(i, self.enc(&block)?);
+                written = true;
+            } else {
+                self.server.write(i, self.enc(&block_i)?);
+            }
+        }
+        Ok(())
     }
 
     fn capacity(&self) -> usize {
@@ -474,10 +475,6 @@ impl ORAM for TreeORAM {
         } else {
             Err(String::from("state is empty"))
         }
-    }
-
-    fn pop(&self) -> Result<Block, String> {
-        unimplemented!()
     }
 
     fn capacity(&self) -> usize {
