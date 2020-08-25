@@ -21,6 +21,7 @@ impl<T: Clone> Server<T> {
             length,
         }
     }
+
     fn read(&self, i: usize) -> Option<T> {
         let x = self.inner.borrow().get(i)?.clone();
         Some(x)
@@ -33,27 +34,27 @@ impl<T: Clone> Server<T> {
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 struct Block {
-    inner: [u8; 32],
+    inner: Vec<u8>,
     empty: bool,
     leaf: LeafIdx,
     u: Idx,
 }
 
 impl Block {
-    fn empty() -> Block {
-        Self::empty_with_u(Idx::max_value())
+    fn empty(size: usize) -> Block {
+        Self::empty_with_u(size, Idx::max_value())
     }
 
-    fn empty_with_u(u: Idx) -> Block {
+    fn empty_with_u(size: usize, u: Idx) -> Block {
         Block {
-            inner: rand::random(),
+            inner: vec![0; size],
             empty: true,
             leaf: 0,
             u,
         }
     }
 
-    fn new(u: Idx, value: [u8; 32], leaf: LeafIdx) -> Block {
+    fn new(u: Idx, value: Vec<u8>, leaf: LeafIdx) -> Block {
         Block {
             inner: value,
             empty: false,
@@ -69,39 +70,55 @@ type LeafIdx = usize;
 trait ORAM {
     fn read_and_remove(&self, u: Idx) -> Result<Block, String>;
     fn add(&self, block: &Block) -> Result<(), String>;
-    fn capacity(&self) -> usize;
+    fn get_capacity(&self) -> usize;
+    fn get_block_size(&self) -> usize;
 
     fn read(&self, u: Idx) -> Result<Block, String> {
         let block = self.read_and_remove(u)?;
         self.add(&block)?;
-        Ok(block)
+
+        if block.inner.len() != self.get_block_size() {
+            Err(String::from("invalid block size"))
+        } else {
+            Ok(block)
+        }
     }
 
     fn write(&self, block: &Block) -> Result<(), String> {
-        self.read_and_remove(block.u)?;
-        self.add(block)
+        if block.inner.len() != self.get_block_size() {
+            Err(String::from("invalid block size"))
+        } else {
+            self.read_and_remove(block.u)?;
+            self.add(block)
+        }
     }
 }
 
 #[derive(Debug)]
 struct TrivialORAM {
+    block_size: usize,
     key: [u8; 32],
     nonce: [u8; 32],
     server: Server<String>,
 }
 
 impl TrivialORAM {
-    fn new(n: usize) -> TrivialORAM {
-        let f = || serde_json::to_string(&Block::empty()).unwrap();
+    fn new(n: usize, block_size: usize) -> TrivialORAM {
+        let f = || serde_json::to_string(&Block::empty(block_size)).unwrap();
         let server = Server::new(n, &f);
-        TrivialORAM::with_server(server)
+        TrivialORAM {
+            block_size,
+            key: [0; 32],
+            nonce: [0; 32],
+            server,
+        }
     }
 
-    fn with_leaf_generator<F>(n: usize, leaf_generator: &F) -> TrivialORAM
+    fn with_leaf_generator<F>(n: usize, block_size: usize, leaf_generator: &F) -> TrivialORAM
         where F : Fn() -> LeafIdx {
         let f = || {
             let b = Block {
-                inner: rand::random(),
+                inner: vec![0; block_size],
                 empty: true,
                 leaf: leaf_generator(),
                 u: Idx::max_value(),
@@ -109,11 +126,8 @@ impl TrivialORAM {
             serde_json::to_string(&b).unwrap()
         };
         let server = Server::new(n, &f);
-        TrivialORAM::with_server(server)
-    }
-
-    fn with_server(server: Server<String>) -> TrivialORAM {
         TrivialORAM {
+            block_size,
             key: [0; 32],
             nonce: [0; 32],
             server,
@@ -159,7 +173,7 @@ impl TrivialORAM {
                     output = Ok(block);
                 }
             } else {
-                let mut empty_block = Block::empty();
+                let mut empty_block = Block::empty(self.block_size);
                 empty_block.leaf = block.leaf;
                 self.server.write(i, self.enc(&empty_block)?);
                 output = Ok(block);
@@ -172,12 +186,12 @@ impl TrivialORAM {
 
 impl ORAM for TrivialORAM {
     fn read_and_remove(&self, u: Idx) -> Result<Block, String> {
-        let mut output = Ok(Block::empty());
+        let mut output = Ok(Block::empty(self.block_size));
         for i in 0..self.server.length {
             let block = self.server.read(i).unwrap();
             let block: Block = self.dec(&block)?;
             if block.u == u {
-                let mut empty_block = Block::empty();
+                let mut empty_block = Block::empty(self.block_size);
                 empty_block.leaf = block.leaf;
                 self.server.write(i, self.enc(&empty_block)?);
                 output = Ok(block);
@@ -202,9 +216,13 @@ impl ORAM for TrivialORAM {
         Ok(())
     }
 
-    fn capacity(&self) -> usize {
+    fn get_capacity(&self) -> usize {
         self.server.length
     }
+
+     fn get_block_size(&self) -> usize {
+         self.block_size
+     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -273,6 +291,7 @@ impl TreeNode {
     }
 }
 
+// NOTE the implementation currently fixes c=2
 struct TreeORAM {
     depth: usize,
     root: Box<TreeNode>,
@@ -298,18 +317,19 @@ fn log2usize(x: usize) -> usize {
 impl TreeORAM {
     fn new(depth: usize) -> TreeORAM {
         let bucket_size = std::cmp::max(1, depth); // bucket size should be O(log(N)), so using the depth should be ok
+        let block_size = Self::compute_block_size(depth);
 
         let f = |path: &Path| {
             let leaf_gen = || {
                 let (leaf, _) = extend_path_rand(path, depth);
                 leaf
             };
-            Bucket::with_leaf_generator(bucket_size, &leaf_gen)
+            Bucket::with_leaf_generator(bucket_size, block_size, &leaf_gen)
         };
         let boxed_tree = TreeORAM::create_tree(depth, &f).unwrap();
 
-        let leaves_count = 2usize.pow(depth as u32);
-        let position_map = TrivialORAM::new(leaves_count);
+        let leaves_count = 2usize.pow(depth as u32); // this is also the N
+        let position_map = TrivialORAM::new(leaves_count, block_size);
 
         TreeORAM {
             depth,
@@ -389,16 +409,17 @@ impl TreeORAM {
                 let b = path[d]; // NOTE: but the paper says d+1?
 
                 let empty_msg = String::from("empty");
+                let empty_block = Block::empty(self.get_block_size());
                 // println!("evicting {:?} {:?}, {:?}", path, b, block);
                 // TODO write order leaks information
                 match b {
                     Direction::Left => {
                         node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&block))?;
-                        node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&Block::empty()))?;
+                        node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&empty_block))?;
                     },
                     Direction::Right => {
                         node.right.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&block))?;
-                        node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&Block::empty()))?;
+                        node.left.as_ref().ok_or(empty_msg.clone()).and_then(|x| x.bucket.write(&empty_block))?;
                     }
                 }
             }
@@ -419,15 +440,21 @@ impl TreeORAM {
         }
         rec(self.root.as_ref(), depth)
     }
+
+    fn compute_block_size(depth: usize) -> usize {
+        // We fix c=2, so 2 = B/(log N), B = 2*(log N) where N = 2^D, so B = 2*D
+        // NOTE: block size is measured in bits in the paper, but here's we're measuring it as bytes.
+        2*depth
+    }
 }
 
-fn encode_leaf(leaf: &LeafIdx) -> [u8; 32] {
-    let mut out: [u8; 32] = [0; 32];
-    out[..8].copy_from_slice(&leaf.to_be_bytes());
+fn encode_leaf(leaf: &LeafIdx, size: usize) -> Vec<u8> {
+    let mut out = leaf.to_be_bytes().to_vec();
+    out.resize(size, 0);
     out
 }
 
-fn decode_leaf(encoded: &[u8; 32]) -> LeafIdx {
+fn decode_leaf(encoded: &Vec<u8>) -> LeafIdx {
     let mut tmp: [u8; 8] = [0; 8];
     tmp.copy_from_slice(&encoded[..8]);
     LeafIdx::from_be_bytes(tmp)
@@ -435,7 +462,7 @@ fn decode_leaf(encoded: &[u8; 32]) -> LeafIdx {
 
 impl ORAM for TreeORAM {
     fn read_and_remove(&self, u: usize) -> Result<Block, String> {
-        if u >= self.position_map.capacity() {
+        if u >= self.position_map.get_capacity() {
             return Err(String::from("invalid index"));
         }
 
@@ -444,10 +471,10 @@ impl ORAM for TreeORAM {
         let path = leaf_to_path(leaf, self.depth);
         // println!("reading u: {:?}, leaf: {:?}, path: {:?}", u, leaf, path);
 
-        self.position_map.write(&Block::new(u, encode_leaf(&leaf_star), 0))?;
+        self.position_map.write(&Block::new(u, encode_leaf(&leaf_star, self.get_block_size()), 0))?;
         *self.state.borrow_mut() = Some(path_to_leaf(&path_star));
 
-        let mut out = Block::empty();
+        let mut out = Block::empty(self.get_block_size());
         let mut current_node = self.root.as_ref();
         for i in 0..self.depth {
             let x = current_node.bucket.read_and_remove(u)?;
@@ -477,8 +504,12 @@ impl ORAM for TreeORAM {
         }
     }
 
-    fn capacity(&self) -> usize {
+    fn get_capacity(&self) -> usize {
         self.get_n()
+    }
+
+    fn get_block_size(&self) -> usize {
+        Self::compute_block_size(self.depth)
     }
 }
 
@@ -490,10 +521,12 @@ mod tests {
     #[test]
     fn trivial_oram() {
         let oram_size = 10;
-        let oram = TrivialORAM::new(oram_size);
+        const BLOCK_SIZE: usize = 32;
+        let oram = TrivialORAM::new(oram_size, BLOCK_SIZE);
 
         // test encoding
-        for b in vec![Block::empty(), Block::new(1, rand::random(), rand::random())] {
+        let rand_value: [u8; BLOCK_SIZE] = rand::random();
+        for b in vec![Block::empty(BLOCK_SIZE), Block::new(1, rand_value.to_vec(), rand::random())] {
             let encoded = oram.enc(&b).unwrap();
             let decoded = oram.dec(&encoded).unwrap();
             assert_eq!(b, decoded);
@@ -506,29 +539,29 @@ mod tests {
         }
 
         {
-            let block = Block::new(0, [1; 32], 0);
+            let block = Block::new(0, vec![1; BLOCK_SIZE], 0);
             assert_eq!(oram.write(&block).unwrap(), ());
             assert_eq!(oram.read(0).unwrap(), block);
         }
         assert!(!oram.pop().unwrap().empty);
 
         {
-            let block = Block::new(1, [2; 32], 0);
+            let block = Block::new(1, vec![2; BLOCK_SIZE], 0);
             assert_eq!(oram.write(&block).unwrap(), ());
             assert_eq!(oram.read(1).unwrap(), block);
         }
         assert!(!oram.pop().unwrap().empty);
 
         {
-            let block = Block::new(0, [3; 32], 0);
+            let block = Block::new(0, vec![3; BLOCK_SIZE], 0);
             assert_eq!(oram.write(&block).unwrap(), ());
             assert_eq!(oram.read(0).unwrap(), block);
         }
         assert!(!oram.pop().unwrap().empty);
 
         {
-            assert_eq!(oram.write(&Block::empty_with_u(0)).unwrap(), ());
-            assert_eq!(oram.write(&Block::empty_with_u(1)).unwrap(), ());
+            assert_eq!(oram.write(&Block::empty_with_u(BLOCK_SIZE, 0)).unwrap(), ());
+            assert_eq!(oram.write(&Block::empty_with_u(BLOCK_SIZE, 1)).unwrap(), ());
         }
         assert!(oram.pop().unwrap().empty);
 
@@ -545,14 +578,16 @@ mod tests {
         assert_eq!(leaf_to_path(2, 4), vec![Direction::Left, Direction::Right, Direction::Left, Direction::Left]);
         assert_eq!(leaf_to_path(3, 4), vec![Direction::Right, Direction::Right, Direction::Left, Direction::Left]);
 
+        const BLOCK_SIZE: usize = 32;
+
         for leaf in 0..15 {
             assert_eq!(path_to_leaf(&leaf_to_path(leaf, 4)), leaf);
         }
 
-        assert_eq!(decode_leaf(&encode_leaf(&0)), 0);
+        assert_eq!(decode_leaf(&encode_leaf(&0, BLOCK_SIZE)), 0);
         for _ in 0..10 {
             let leaf: LeafIdx = rand::random();
-            let encoded = encode_leaf(&leaf);
+            let encoded = encode_leaf(&leaf, BLOCK_SIZE);
             let decoded = decode_leaf(&encoded);
             assert_eq!(leaf, decoded);
         }
@@ -568,13 +603,13 @@ mod tests {
         }
 
         // it doesn't matter what leaf is, it will be over written
-        tree.write(&Block::new(0, [u8::max_value(); 32], 0)).unwrap();
+        assert_eq!(tree.write(&Block::new(0, vec![u8::max_value(); tree.get_block_size()], 0)).unwrap(), ());
         assert!(!tree.read(0).unwrap().empty);
 
         // check writing
         for u in vec![0, 1, 2, 8, leaves_count-1] {
-            let block = Block::new(u, [u as u8; 32], 0);
-            tree.write(&block).unwrap();
+            let block = Block::new(u, vec![u as u8; tree.get_block_size()], 0);
+            assert_eq!(tree.write(&block).unwrap(), ());
             let result = tree.read(u).unwrap();
 
             // we don't check the leaf because that's randomized
@@ -590,8 +625,12 @@ mod tests {
         }
 
         // write to index that doesn't exist
-        let bad_index_block = Block::new(leaves_count, [0; 32], 0);
+        let bad_index_block = Block::new(leaves_count, vec![0; tree.get_block_size()], 0);
         assert_eq!(tree.write(&bad_index_block).err().unwrap(), "invalid index");
+
+        // write with an invalid block size
+        let bad_sized_block = Block::new(0, vec![0; tree.get_block_size()*2], 0);
+        assert_eq!(tree.write(&bad_sized_block).err().unwrap(), "invalid block size");
     }
 
     #[test]
@@ -600,7 +639,7 @@ mod tests {
         for d in vec![0, 1, 4] {
             let tree = TreeORAM::new(d);
             assert_eq!(tree.count_nodes(), tree.get_buckets_count());
-            assert_eq!(tree.position_map.capacity(), 1 << d);
+            assert_eq!(tree.position_map.get_capacity(), 1 << d);
             assert!(tree.sanity_check_paths());
         }
 
