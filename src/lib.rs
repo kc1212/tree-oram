@@ -114,8 +114,8 @@ trait ORAM {
             return Err(String::from("invalid start/end"));
         }
         let total_bytes = self.get_block_size()*self.get_capacity();
-        if end >= total_bytes {
-            return Err(String::from("index out of range"));
+        if end > total_bytes {
+            return Err(format!("index out of range end: {} >= total: {}", end, total_bytes));
         }
         Ok(())
     }
@@ -136,10 +136,12 @@ trait ORAM {
         for i in start..end {
             let local_idx = i/b - start_block;
             let inner_idx = i%b;
-            if !blocks[local_idx].empty && blocks[local_idx].u != i/b {
+            if blocks[local_idx].empty {
+                return Err(String::from("empty block"));
+            }
+            if blocks[local_idx].u != i/b {
                 return Err(String::from("invalid block index"));
             }
-            // NOTE: we're not checking whether the block is empty.
             out.push(blocks[local_idx].inner[inner_idx])
         }
         Ok(out)
@@ -335,10 +337,10 @@ fn path_to_leaf(path: &Path) -> LeafIdx {
 }
 
 fn random_path(depth: usize) -> (LeafIdx, Path) {
-    let leaf = rand::random::<LeafIdx>();
+    let long_leaf = rand::random::<LeafIdx>();
     // TODO should we mask the bits in leaf that are not needed?
-    let path = leaf_to_path(leaf, depth);
-    (leaf, path)
+    let path = leaf_to_path(long_leaf, depth);
+    (path_to_leaf(&path), path)
 }
 
 fn extend_path_rand(path: &Path, total_length: usize) -> (LeafIdx, Path) {
@@ -370,12 +372,76 @@ impl TreeNode {
     }
 }
 
+struct PositionMap {
+    leaf_count: usize,
+    inner: Box<dyn ORAM>
+}
+
+impl PositionMap {
+    fn new(leaf_count: usize, oram: Box<dyn ORAM>)  -> PositionMap {
+        PositionMap {
+            leaf_count,
+            inner: oram,
+        }
+    }
+
+    fn get_leaf_len_bytes(&self) -> usize {
+        std::cmp::max(1, log2usize(self.leaf_count)/8)
+    }
+
+    fn encode_leaf(&self, leaf: LeafIdx) -> Vec<u8> {
+        let mut out = leaf.to_le_bytes().to_vec();
+        out.resize(self.get_leaf_len_bytes(), 0);
+        out
+    }
+
+    fn decode_leaf(&self, mut encoded: Vec<u8>) -> LeafIdx {
+        // TODO is there an easy to do all this?
+        assert_eq!(encoded.len(), self.get_leaf_len_bytes());
+        let mut tmp: [u8; 8] = [0; 8];
+        encoded.resize(8, 0);
+        tmp.copy_from_slice(&encoded);
+        LeafIdx::from_le_bytes(tmp)
+    }
+
+    fn read_leaf(&self, id: usize) -> Result<LeafIdx, String> {
+        if id >= self.leaf_count {
+            Err(format!("leaf index is too big"))
+        } else {
+            let l = self.get_leaf_len_bytes();
+            let v = match self.inner.read_u8(id*l, (id+1)*l) {
+                Err(e) => if e == "empty block" {
+                    Ok(vec![0; self.get_leaf_len_bytes()])
+                } else {
+                    Err(e)
+                }
+                x => x,
+            }?;
+            Ok(self.decode_leaf(v))
+        }
+    }
+
+    fn write_leaf(&self, id: usize, leaf: LeafIdx) -> Result<(), String> {
+        if leaf >= self.leaf_count {
+            Err(format!("leaf index is too big"))
+        } else if id >= self.leaf_count {
+            Err(format!("id index is too big"))
+        } else {
+            self.inner.write_u8(id*self.get_leaf_len_bytes(), self.encode_leaf(leaf))
+        }
+    }
+
+    fn get_capacity(&self) -> usize {
+        self.leaf_count
+    }
+}
+
 // NOTE the implementation currently fixes c=2
 struct TreeORAM {
     depth: usize,
     root: Box<TreeNode>,
     state: RefCell<Option<LeafIdx>>,
-    position_map: Box<dyn ORAM>, // mapping of block index and leaf
+    position_map: PositionMap, // mapping of block index and leaf
     eviction_rate: usize,
 }
 
@@ -391,6 +457,10 @@ fn log2usize(x: usize) -> usize {
         }
     }
     i
+}
+
+fn round_up(x: usize, multiple: usize) -> usize {
+    (x + multiple - 1) & (usize::max_value()-multiple+1)
 }
 
 impl TreeORAM {
@@ -410,21 +480,35 @@ impl TreeORAM {
         let boxed_tree = TreeORAM::create_tree(depth, &f).unwrap();
 
         let leaves_count = 2usize.pow(depth as u32); // this is also the N
-        // TODO we actually need the position_map to have n/c blocks
-        let position_map = TrivialORAM::new(leaves_count, block_size);
+        let position_map = {
+            let boxed : Box<dyn ORAM> = {
+                if leaves_count > 4 {
+                    let tree = TreeORAM::new(log2usize(leaves_count/Self::C));
+                    assert_eq!(tree.get_capacity(), leaves_count/Self::C);
+                    Box::new(tree)
+                } else {
+                    let trivial = TrivialORAM::new(
+                        if leaves_count >= Self::C {leaves_count/Self::C} else {leaves_count},
+                        block_size);
+                    Box::new(trivial)
+                }
+            };
+            let pmap = PositionMap::new(leaves_count, boxed);
+            pmap
+        };
 
         TreeORAM {
             depth,
             root: boxed_tree,
             state: RefCell::new(None),
-            position_map: Box::new(position_map),
-            eviction_rate: 2,
+            position_map,
+            eviction_rate: 4,
         }
     }
 
     fn create_tree<F>(depth: usize, node_constructor: &F) -> Option<Box<TreeNode>>
         where F: Fn(&Path) -> Bucket {
-        TreeORAM::create_tree_rec(depth, &Vec::new(), node_constructor)
+        Self::create_tree_rec(depth, &Vec::new(), node_constructor)
     }
 
     fn create_tree_rec<F>(depth: usize, current_path: &Path, node_constructor: &F) -> Option<Box<TreeNode>>
@@ -437,8 +521,8 @@ impl TreeORAM {
             let mut node = TreeNode::new(node_constructor(current_path));
             let mut path_left = current_path.clone(); path_left.push(Direction::Left);
             let mut path_right = current_path.clone(); path_right.push(Direction::Right);
-            node.left = TreeORAM::create_tree_rec(depth - 1, &path_left, node_constructor);
-            node.right = TreeORAM::create_tree_rec(depth - 1, &path_right, node_constructor);
+            node.left = Self::create_tree_rec(depth - 1, &path_left, node_constructor);
+            node.right = Self::create_tree_rec(depth - 1, &path_right, node_constructor);
             Some(Box::new(node))
         }
     }
@@ -525,20 +609,8 @@ impl TreeORAM {
     fn compute_block_size(depth: usize) -> usize {
         // We fix c=2, so 2 = B/(log N), B = 2*(log N) where N = 2^D, so B = 2*D
         // NOTE: block size is measured in bits in the paper, but here's we're measuring it as bytes.
-        Self::C*depth
+        std::cmp::max(8, round_up(Self::C*depth, 8)/8)
     }
-}
-
-fn encode_leaf(leaf: &LeafIdx, size: usize) -> Vec<u8> {
-    let mut out = leaf.to_be_bytes().to_vec();
-    out.resize(size, 0);
-    out
-}
-
-fn decode_leaf(encoded: &Vec<u8>) -> LeafIdx {
-    let mut tmp: [u8; 8] = [0; 8];
-    tmp.copy_from_slice(&encoded[..8]);
-    LeafIdx::from_be_bytes(tmp)
 }
 
 impl ORAM for TreeORAM {
@@ -548,10 +620,10 @@ impl ORAM for TreeORAM {
         }
 
         let (leaf_star, path_star) = random_path(self.depth);
-        let leaf = decode_leaf(&self.position_map.read(u)?.inner);
+        let leaf = self.position_map.read_leaf(u)?;
         let path = leaf_to_path(leaf, self.depth);
 
-        self.position_map.write(&Block::new(u, encode_leaf(&leaf_star, self.get_block_size()), 0))?;
+        self.position_map.write_leaf(u, leaf_star)?;
         *self.state.borrow_mut() = Some(path_to_leaf(&path_star));
 
         let mut out = Block::empty(self.get_block_size());
@@ -592,7 +664,11 @@ impl ORAM for TreeORAM {
     }
 
     fn dump_data(&self) -> Vec<Block> {
-        unimplemented!()
+        let mut blocks = Vec::new();
+        for i in 0..self.get_capacity() {
+            blocks.push(self.read(i).unwrap());
+        }
+        blocks
     }
 }
 
@@ -611,19 +687,13 @@ mod tests {
         assert_eq!(leaf_to_path(2, 4), vec![Direction::Left, Direction::Right, Direction::Left, Direction::Left]);
         assert_eq!(leaf_to_path(3, 4), vec![Direction::Right, Direction::Right, Direction::Left, Direction::Left]);
 
-        const BLOCK_SIZE: usize = 32;
-
         for leaf in 0..15 {
             assert_eq!(path_to_leaf(&leaf_to_path(leaf, 4)), leaf);
         }
 
-        assert_eq!(decode_leaf(&encode_leaf(&0, BLOCK_SIZE)), 0);
-        for _ in 0..10 {
-            let leaf: LeafIdx = rand::random();
-            let encoded = encode_leaf(&leaf, BLOCK_SIZE);
-            let decoded = decode_leaf(&encoded);
-            assert_eq!(leaf, decoded);
-        }
+        assert_eq!(round_up(1, 8), 8);
+        assert_eq!(round_up(7, 8), 8);
+        assert_eq!(round_up(9, 8), 16);
     }
 
     #[test]
@@ -688,8 +758,14 @@ mod tests {
         let leaves_count = 2usize.pow(oram_depth as u32);
         let tree = TreeORAM::new(oram_depth);
 
+        // test position map
+        assert_eq!(tree.position_map.write_leaf(0, 1).unwrap(), ());
+        assert_eq!(tree.position_map.read_leaf(0).unwrap(), 1);
+        assert_eq!(tree.position_map.write_leaf(0, 2).unwrap(), ());
+        assert_eq!(tree.position_map.read_leaf(0).unwrap(), 2);
+
         // check all is empty
-        for i in 0..tree.get_n() {
+        for i in 0..tree.get_capacity() {
             assert!(tree.read(i).unwrap().empty);
         }
 
@@ -730,7 +806,6 @@ mod tests {
         for d in vec![0, 1, 4] {
             let tree = TreeORAM::new(d);
             assert_eq!(tree.count_nodes(), tree.get_buckets_count());
-            assert_eq!(tree.position_map.get_capacity(), 1 << d);
             assert!(tree.sanity_check_paths());
         }
 
@@ -747,10 +822,6 @@ mod tests {
         let start_idx = b/2;
         assert_eq!(oram.write_u8(start_idx, vec![42; b]).unwrap(), ());
         assert_eq!(oram.read_u8(start_idx, start_idx+b).unwrap(), vec![42; b]);
-
-        assert_eq!(oram.write_u8(0, vec![24; b/2]).unwrap(), ());
-        assert_eq!(oram.read_u8(0, b/2).unwrap(), vec![24; b/2]);
-        assert_eq!(oram.read_u8(b/2, b).unwrap(), vec![42; b/2]);
     }
 
     #[test]
@@ -763,11 +834,7 @@ mod tests {
 
     #[test]
     fn tree_oram_u8_io() {
-        let tree1 = TreeORAM::new(5);
-        generic_oram_u8_io(&tree1);
-
-        let tree2 = TreeORAM::new(4);
+        let tree2 = TreeORAM::new(3);
         generic_oram_u8_io(&tree2);
     }
-
 }
