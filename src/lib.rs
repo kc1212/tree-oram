@@ -72,6 +72,7 @@ trait ORAM {
     fn add(&self, block: &Block) -> Result<(), String>;
     fn get_capacity(&self) -> usize;
     fn get_block_size(&self) -> usize;
+    fn dump_data(&self) -> Vec<Block>;
 
     fn read(&self, u: Idx) -> Result<Block, String> {
         let block = self.read_and_remove(u)?;
@@ -84,6 +85,14 @@ trait ORAM {
         }
     }
 
+    fn read_more(&self, start: Idx, end: Idx) -> Result<Vec<Block>, String> {
+        let mut blocks = Vec::new();
+        for i in start..end {
+            blocks.push(self.read(i)?);
+        }
+        Ok(blocks)
+    }
+
     fn write(&self, block: &Block) -> Result<(), String> {
         if block.inner.len() != self.get_block_size() {
             Err(String::from("invalid block size"))
@@ -91,6 +100,76 @@ trait ORAM {
             self.read_and_remove(block.u)?;
             self.add(block)
         }
+    }
+
+    fn write_more(&self, blocks: &Vec<Block>) -> Result<(), String> {
+        for block in blocks {
+            self.write(block)?;
+        }
+        Ok(())
+    }
+
+    fn sanity_check_u8_io(&self, start: usize, end: usize) -> Result<(), String> {
+        if end < start {
+            return Err(String::from("invalid start/end"));
+        }
+        let total_bytes = self.get_block_size()*self.get_capacity();
+        if end >= total_bytes {
+            return Err(String::from("index out of range"));
+        }
+        Ok(())
+    }
+
+    fn read_u8(&self, start: usize, end: usize) -> Result<Vec<u8>, String> {
+        self.sanity_check_u8_io(start, end)?;
+
+        let b = self.get_block_size();
+        if end == start {
+            return Ok(Vec::new());
+        }
+
+        let start_block = start/b;
+        let end_block = if (end % b) == 0 {end/b} else {(end+b)/b};
+        let blocks = self.read_more(start_block, end_block)?;
+
+        let mut out = Vec::new();
+        for i in start..end {
+            let local_idx = i/b - start_block;
+            let inner_idx = i%b;
+            if !blocks[local_idx].empty && blocks[local_idx].u != i/b {
+                return Err(String::from("invalid block index"));
+            }
+            // NOTE: we're not checking whether the block is empty.
+            out.push(blocks[local_idx].inner[inner_idx])
+        }
+        Ok(out)
+    }
+
+    fn write_u8(&self, start: usize, data: Vec<u8>) -> Result<(), String> {
+        // NOTE: this function does a read_more and a write_more,
+        // so it's not indistinguishable from read_u8.
+        // We have to read the data back first because we don't want to change
+        // the existing part of the block that is not overwritten.
+        let end = start + data.len();
+        self.sanity_check_u8_io(start, end)?;
+
+        let b = self.get_block_size();
+        let start_block = start/b;
+        let end_block = if (end % b) == 0 {end/b} else {(end+b)/b};
+
+        let mut blocks = self.read_more(start_block, end_block)?;
+
+        for i in start..end {
+            let local_idx = i/b - start_block;
+            let inner_idx = i%b;
+            if !blocks[local_idx].empty && blocks[local_idx].u != i/b {
+                return Err(String::from("invalid block index"));
+            }
+            blocks[local_idx].inner[inner_idx] = data[i-start];
+            blocks[local_idx].u = i/b;
+            blocks[local_idx].empty = false;
+        }
+        self.write_more(&blocks)
     }
 }
 
@@ -147,12 +226,6 @@ impl TrivialORAM {
             Ok(v) => Ok(v),
             Err(e) => Err(e.to_string()),
         }
-    }
-
-    fn dump_data(&self) -> Vec<Block> {
-        self.server.inner.borrow() .iter().map(|s| {
-            self.dec(s).unwrap()
-        }).collect()
     }
 
     fn pop(&self) -> Result<Block, String> {
@@ -220,9 +293,15 @@ impl ORAM for TrivialORAM {
         self.server.length
     }
 
-     fn get_block_size(&self) -> usize {
-         self.block_size
-     }
+    fn get_block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn dump_data(&self) -> Vec<Block> {
+        self.server.inner.borrow() .iter().map(|s| {
+            self.dec(s).unwrap()
+        }).collect()
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -315,6 +394,8 @@ fn log2usize(x: usize) -> usize {
 }
 
 impl TreeORAM {
+    const C: usize = 2;
+
     fn new(depth: usize) -> TreeORAM {
         let bucket_size = std::cmp::max(1, depth); // bucket size should be O(log(N)), so using the depth should be ok
         let block_size = Self::compute_block_size(depth);
@@ -329,6 +410,7 @@ impl TreeORAM {
         let boxed_tree = TreeORAM::create_tree(depth, &f).unwrap();
 
         let leaves_count = 2usize.pow(depth as u32); // this is also the N
+        // TODO we actually need the position_map to have n/c blocks
         let position_map = TrivialORAM::new(leaves_count, block_size);
 
         TreeORAM {
@@ -410,7 +492,6 @@ impl TreeORAM {
 
                 let empty_msg = String::from("empty");
                 let empty_block = Block::empty(self.get_block_size());
-                // println!("evicting {:?} {:?}, {:?}", path, b, block);
                 // TODO write order leaks information
                 match b {
                     Direction::Left => {
@@ -444,7 +525,7 @@ impl TreeORAM {
     fn compute_block_size(depth: usize) -> usize {
         // We fix c=2, so 2 = B/(log N), B = 2*(log N) where N = 2^D, so B = 2*D
         // NOTE: block size is measured in bits in the paper, but here's we're measuring it as bytes.
-        2*depth
+        Self::C*depth
     }
 }
 
@@ -469,7 +550,6 @@ impl ORAM for TreeORAM {
         let (leaf_star, path_star) = random_path(self.depth);
         let leaf = decode_leaf(&self.position_map.read(u)?.inner);
         let path = leaf_to_path(leaf, self.depth);
-        // println!("reading u: {:?}, leaf: {:?}, path: {:?}", u, leaf, path);
 
         self.position_map.write(&Block::new(u, encode_leaf(&leaf_star, self.get_block_size()), 0))?;
         *self.state.borrow_mut() = Some(path_to_leaf(&path_star));
@@ -487,7 +567,6 @@ impl ORAM for TreeORAM {
                 current_node = current_node.right.as_ref().unwrap();
             }
         }
-        // println!("read and remove {:?}", out);
         Ok(out)
     }
 
@@ -511,12 +590,41 @@ impl ORAM for TreeORAM {
     fn get_block_size(&self) -> usize {
         Self::compute_block_size(self.depth)
     }
+
+    fn dump_data(&self) -> Vec<Block> {
+        unimplemented!()
+    }
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_functions() {
+        assert_eq!(log2usize(2), 1);
+        assert_eq!(log2usize(4), 2);
+        assert_eq!(log2usize(128), 7);
+
+        assert_eq!(leaf_to_path(1, 4), vec![Direction::Right, Direction::Left, Direction::Left, Direction::Left]);
+        assert_eq!(leaf_to_path(2, 4), vec![Direction::Left, Direction::Right, Direction::Left, Direction::Left]);
+        assert_eq!(leaf_to_path(3, 4), vec![Direction::Right, Direction::Right, Direction::Left, Direction::Left]);
+
+        const BLOCK_SIZE: usize = 32;
+
+        for leaf in 0..15 {
+            assert_eq!(path_to_leaf(&leaf_to_path(leaf, 4)), leaf);
+        }
+
+        assert_eq!(decode_leaf(&encode_leaf(&0, BLOCK_SIZE)), 0);
+        for _ in 0..10 {
+            let leaf: LeafIdx = rand::random();
+            let encoded = encode_leaf(&leaf, BLOCK_SIZE);
+            let decoded = decode_leaf(&encoded);
+            assert_eq!(leaf, decoded);
+        }
+    }
 
     #[test]
     fn trivial_oram() {
@@ -542,8 +650,14 @@ mod tests {
             let block = Block::new(0, vec![1; BLOCK_SIZE], 0);
             assert_eq!(oram.write(&block).unwrap(), ());
             assert_eq!(oram.read(0).unwrap(), block);
+
+            // overwrite
+            let block2 = Block::new(0, vec![2; BLOCK_SIZE], 0);
+            assert_eq!(oram.write(&block2).unwrap(), ());
+            assert_eq!(oram.read(0).unwrap(), block2);
         }
         assert!(!oram.pop().unwrap().empty);
+        assert!(oram.pop().unwrap().empty);
 
         {
             let block = Block::new(1, vec![2; BLOCK_SIZE], 0);
@@ -551,6 +665,7 @@ mod tests {
             assert_eq!(oram.read(1).unwrap(), block);
         }
         assert!(!oram.pop().unwrap().empty);
+        assert!(oram.pop().unwrap().empty);
 
         {
             let block = Block::new(0, vec![3; BLOCK_SIZE], 0);
@@ -558,6 +673,7 @@ mod tests {
             assert_eq!(oram.read(0).unwrap(), block);
         }
         assert!(!oram.pop().unwrap().empty);
+        assert!(oram.pop().unwrap().empty);
 
         {
             assert_eq!(oram.write(&Block::empty_with_u(BLOCK_SIZE, 0)).unwrap(), ());
@@ -566,31 +682,6 @@ mod tests {
         assert!(oram.pop().unwrap().empty);
 
         assert_eq!(oram.dump_data().len(), oram_size);
-    }
-
-    #[test]
-    fn helper_functions() {
-        assert_eq!(log2usize(2), 1);
-        assert_eq!(log2usize(4), 2);
-        assert_eq!(log2usize(128), 7);
-
-        assert_eq!(leaf_to_path(1, 4), vec![Direction::Right, Direction::Left, Direction::Left, Direction::Left]);
-        assert_eq!(leaf_to_path(2, 4), vec![Direction::Left, Direction::Right, Direction::Left, Direction::Left]);
-        assert_eq!(leaf_to_path(3, 4), vec![Direction::Right, Direction::Right, Direction::Left, Direction::Left]);
-
-        const BLOCK_SIZE: usize = 32;
-
-        for leaf in 0..15 {
-            assert_eq!(path_to_leaf(&leaf_to_path(leaf, 4)), leaf);
-        }
-
-        assert_eq!(decode_leaf(&encode_leaf(&0, BLOCK_SIZE)), 0);
-        for _ in 0..10 {
-            let leaf: LeafIdx = rand::random();
-            let encoded = encode_leaf(&leaf, BLOCK_SIZE);
-            let decoded = decode_leaf(&encoded);
-            assert_eq!(leaf, decoded);
-        }
     }
 
     fn generic_tree_oram_io(oram_depth: usize) {
@@ -647,4 +738,36 @@ mod tests {
         generic_tree_oram_io(4);
         generic_tree_oram_io(5);
     }
+
+    fn generic_oram_u8_io(oram: &dyn ORAM) {
+        assert_eq!(oram.write_u8(0, vec![42]).unwrap(), ());
+        assert_eq!(oram.read_u8(0, 1).unwrap(), vec![42]);
+
+        let b = oram.get_block_size();
+        let start_idx = b/2;
+        assert_eq!(oram.write_u8(start_idx, vec![42; b]).unwrap(), ());
+        assert_eq!(oram.read_u8(start_idx, start_idx+b).unwrap(), vec![42; b]);
+
+        assert_eq!(oram.write_u8(0, vec![24; b/2]).unwrap(), ());
+        assert_eq!(oram.read_u8(0, b/2).unwrap(), vec![24; b/2]);
+        assert_eq!(oram.read_u8(b/2, b).unwrap(), vec![42; b/2]);
+    }
+
+    #[test]
+    fn trivial_oram_u8_io() {
+        let oram_size = 10;
+        const BLOCK_SIZE: usize = 32;
+        let oram = TrivialORAM::new(oram_size, BLOCK_SIZE);
+        generic_oram_u8_io(&oram);
+    }
+
+    #[test]
+    fn tree_oram_u8_io() {
+        let tree1 = TreeORAM::new(5);
+        generic_oram_u8_io(&tree1);
+
+        let tree2 = TreeORAM::new(4);
+        generic_oram_u8_io(&tree2);
+    }
+
 }
