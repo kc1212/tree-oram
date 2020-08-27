@@ -1,51 +1,25 @@
+mod server;
+use server::Server;
+
 use std::cell::RefCell;
 use rand::prelude::*;
 
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug)]
-struct Server<T: Clone> {
-    inner: RefCell<Vec<T>>,
-    length: usize,
-}
-
-impl<T: Clone> Server<T> {
-    fn new<F>(length: usize, default: &F) -> Server<T>
-        where F: Fn() -> T {
-        let mut vs: Vec<T> = Vec::new();
-        for _ in 0..length {
-            vs.push(default());
-        }
-        Server {
-            inner: RefCell::new(vs),
-            length,
-        }
-    }
-
-    fn read(&self, i: usize) -> Option<T> {
-        let x = self.inner.borrow().get(i)?.clone();
-        Some(x)
-    }
-
-    fn write(&self, i: usize, x: T) {
-        self.inner.borrow_mut()[i] = x;
-    }
-}
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 struct Block {
     inner: Vec<u8>,
     empty: bool,
     leaf: LeafIdx,
-    u: Idx,
+    u: BlockIdx,
 }
 
 impl Block {
     fn empty(size: usize) -> Block {
-        Self::empty_with_u(size, Idx::max_value())
+        Self::empty_with_u(size, BlockIdx::max_value())
     }
 
-    fn empty_with_u(size: usize, u: Idx) -> Block {
+    fn empty_with_u(size: usize, u: BlockIdx) -> Block {
         Block {
             inner: vec![0; size],
             empty: true,
@@ -54,7 +28,7 @@ impl Block {
         }
     }
 
-    fn new(u: Idx, value: Vec<u8>, leaf: LeafIdx) -> Block {
+    fn new(u: BlockIdx, value: Vec<u8>, leaf: LeafIdx) -> Block {
         Block {
             inner: value,
             empty: false,
@@ -64,17 +38,17 @@ impl Block {
     }
 }
 
-type Idx = usize;
+type BlockIdx = usize;
 type LeafIdx = usize;
 
 trait ORAM {
-    fn read_and_remove(&self, u: Idx) -> Result<Block, String>;
+    fn read_and_remove(&self, u: BlockIdx) -> Result<Block, String>;
     fn add(&self, block: &Block) -> Result<(), String>;
     fn get_capacity(&self) -> usize;
     fn get_block_size(&self) -> usize;
     fn dump_data(&self) -> Vec<Block>;
 
-    fn read(&self, u: Idx) -> Result<Block, String> {
+    fn read(&self, u: BlockIdx) -> Result<Block, String> {
         let block = self.read_and_remove(u)?;
         self.add(&block)?;
 
@@ -85,7 +59,7 @@ trait ORAM {
         }
     }
 
-    fn read_more(&self, start: Idx, end: Idx) -> Result<Vec<Block>, String> {
+    fn read_more(&self, start: BlockIdx, end: BlockIdx) -> Result<Vec<Block>, String> {
         let mut blocks = Vec::new();
         for i in start..end {
             blocks.push(self.read(i)?);
@@ -202,7 +176,7 @@ impl TrivialORAM {
                 inner: vec![0; block_size],
                 empty: true,
                 leaf: leaf_generator(),
-                u: Idx::max_value(),
+                u: BlockIdx::max_value(),
             };
             serde_json::to_string(&b).unwrap()
         };
@@ -239,7 +213,7 @@ impl TrivialORAM {
         };
 
         let mut output = Err(String::from("no output"));
-        for i in 0..self.server.length {
+        for i in 0..self.server.get_length() {
             let block = self.server.read(i).unwrap();
             let block: Block = self.dec(&block)?;
             if block.empty {
@@ -260,9 +234,9 @@ impl TrivialORAM {
 }
 
 impl ORAM for TrivialORAM {
-    fn read_and_remove(&self, u: Idx) -> Result<Block, String> {
+    fn read_and_remove(&self, u: BlockIdx) -> Result<Block, String> {
         let mut output = Ok(Block::empty(self.block_size));
-        for i in 0..self.server.length {
+        for i in 0..self.server.get_length() {
             let block = self.server.read(i).unwrap();
             let block: Block = self.dec(&block)?;
             if block.u == u {
@@ -279,7 +253,7 @@ impl ORAM for TrivialORAM {
 
     fn add(&self, block: &Block) -> Result<(), String> {
         let mut written = false;
-        for i in 0..self.server.length {
+        for i in 0..self.server.get_length() {
             let block_i: Block = self.dec(&self.server.read(i).unwrap())?;
             if block_i.empty && !written {
                 self.server.write(i, self.enc(&block)?);
@@ -292,7 +266,7 @@ impl ORAM for TrivialORAM {
     }
 
     fn get_capacity(&self) -> usize {
-        self.server.length
+        self.server.get_length()
     }
 
     fn get_block_size(&self) -> usize {
@@ -300,7 +274,7 @@ impl ORAM for TrivialORAM {
     }
 
     fn dump_data(&self) -> Vec<Block> {
-        self.server.inner.borrow() .iter().map(|s| {
+        self.server.dump_data().iter().map(|s| {
             self.dec(s).unwrap()
         }).collect()
     }
@@ -436,7 +410,6 @@ impl PositionMap {
     }
 }
 
-// NOTE the implementation currently fixes c=2
 struct TreeORAM {
     depth: usize,
     root: Box<TreeNode>,
@@ -464,6 +437,7 @@ fn round_up(x: usize, multiple: usize) -> usize {
 }
 
 impl TreeORAM {
+    // This implementation currently fixes c=2, from c and the depth we derive the block size.
     const C: usize = 2;
 
     fn new(depth: usize) -> TreeORAM {
@@ -483,6 +457,7 @@ impl TreeORAM {
         let position_map = {
             let boxed : Box<dyn ORAM> = {
                 if leaves_count > 4 {
+                    // Here we recursively apply the tree ORAM.
                     let tree = TreeORAM::new(log2usize(leaves_count/Self::C));
                     assert_eq!(tree.get_capacity(), leaves_count/Self::C);
                     Box::new(tree)
@@ -502,6 +477,9 @@ impl TreeORAM {
             root: boxed_tree,
             state: RefCell::new(None),
             position_map,
+            // NOTE: it seems when eviction rate is higher,
+            // leaf ID are less likely to stomp on each other.
+            // This might also be a bug, needs more investigation.
             eviction_rate: 4,
         }
     }
@@ -712,7 +690,7 @@ mod tests {
 
         // test actual oram
         assert!(oram.pop().unwrap().empty);
-        for i in 0..oram.server.length {
+        for i in 0..oram.server.get_length() {
             assert!(oram.read(i).unwrap().empty);
         }
 
@@ -834,7 +812,7 @@ mod tests {
 
     #[test]
     fn tree_oram_u8_io() {
-        let tree2 = TreeORAM::new(3);
+        let tree2 = TreeORAM::new(4);
         generic_oram_u8_io(&tree2);
     }
 }
